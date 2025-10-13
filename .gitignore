@@ -1,0 +1,9 @@
+# 忽略所有依赖项
+node_modules/
+
+# 忽略环境变量文件
+.env
+
+# 忽略截图和用户数据文件夹
+screenshots/
+user_data_agent/

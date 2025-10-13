@@ -1,0 +1,27 @@
+{
+  "name": "local-automation-agent",
+  "version": "1.5.0",
+  "description": "本地自动化代理，用于执行截图和数据抓取任务。现已支持TOS上传。",
+  "main": "local-agent.js",
+  "scripts": {
+    "start": "node local-agent.js",
+    "watch": "node local-agent.js --watch"
+  },
+  "keywords": [
+    "puppeteer",
+    "automation",
+    "mongodb",
+    "tos"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.592.0",
+    "@volcengine/tos-sdk": "^2.7.5",
+    "dotenv": "^16.3.1",
+    "mongodb": "^6.3.0",
+    "puppeteer-core": "^21.5.2",
+    "sharp": "^0.34.4",
+    "uuid": "^9.0.1"
+  }
+}
