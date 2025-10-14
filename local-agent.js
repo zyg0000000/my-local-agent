@@ -1,11 +1,8 @@
 /**
  * @file local-agent.js
- * @version 3.0 - Local Job Sync
- * @description [功能升级] Agent 现在可以直接在本地完成 Job 状态的联动更新。
- * - [核心新增] 从云函数移植了 `recalculateAndSyncJobStats` 逻辑，使其成为 Agent 的本地函数。
- * - [最小化修改] 在任务成功或失败回写数据库后，立即调用此函数，触发父级 Job 状态的重新计算和同步。
- * - [兼容性] 该同步逻辑仅在任务有关联的 jobId 时触发，完全兼容独立的 Task。
- * - [效率] 此方案通过在本地直接操作数据库完成所有更新，实现了最高执行效率，避免了额外的网络调用。
+ * @version 3.1 - Adaptor for Dynamic Engine
+ * @description [兼容性改造] 此版本适配了 puppeteer-executor v22.0 的新函数签名。
+ * - [核心修改] 调用 executeActions 时，不再传递零散的 id，而是传递完整的 task 对象，以支持更强大的参数化能力。
  */
 require('dotenv').config();
 const { MongoClient, ObjectId } = require('mongodb');
@@ -122,7 +119,8 @@ async function processNextTask() {
             throw new Error(`数据库中无法找到 ID 为 ${task.workflowId} 的工作流。`);
         }
         
-        const executionResult = await executeActions(task.xingtuId, task._id, workflow);
+        // [核心修改] 调用 executeActions 时传递完整的 task 对象
+        const executionResult = await executeActions(task, workflow);
 
         await tasksCollection.updateOne(
             { _id: new ObjectId(task._id) },

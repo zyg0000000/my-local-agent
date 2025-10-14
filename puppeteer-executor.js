@@ -1,7 +1,9 @@
 /**
  * @file puppeteer-executor.js
- * @version 21.0 - The Definitive Robustness Fix
- * @description 最终部署版。此版本新增了对“无需滚动”情况的智能判断，当内容可被完整显示时，将直接截图，大大提高了代码的健壮性和通用性。
+ * @version 22.0 - Dynamic Navigation Engine
+ * @description [架构升级] 引擎已升级，支持动态导航和参数化。
+ * - [核心改造] executeActions 函数不再硬编码导航URL，而是依赖工作流的第一个 'Go to URL' 步骤。
+ * - [新增功能] 支持在工作流步骤中使用 {{xingtuId}} 和 {{taskId}} 等占位符，执行时会自动替换为任务的实际参数。
  */
 const puppeteer = require('puppeteer-core');
 const fs = require('fs');
@@ -297,24 +299,53 @@ async function handleLogin() {
 /**
  * 核心函数：执行工作流中的所有步骤
  */
-async function executeActions(xingtuId, taskId, workflow) {
+async function executeActions(task, workflow) {
+    // 待办 1.4: 升级参数替换逻辑
+    const context = {
+        xingtuId: task.xingtuId,
+        taskId: task.taskId, // taskId for starquest, _id for database
+        collaborationId: task.metadata?.collaborationId,
+    };
+
+    // 深拷贝工作流以避免修改内存中的缓存对象
+    const processedWorkflow = JSON.parse(JSON.stringify(workflow));
+
+    // 遍历所有步骤，替换占位符
+    processedWorkflow.steps.forEach(step => {
+        for (const key in step) {
+            if (typeof step[key] === 'string') {
+                step[key] = step[key].replace(/\{\{(\w+)\}\}/g, (match, placeholder) => {
+                    // 如果上下文中存在该占位符，则替换；否则保持原样
+                    return context[placeholder] || match;
+                });
+            }
+        }
+    });
+
     const br = await getBrowser();
     const page = await br.newPage();
     const results = { screenshots: [], data: {} };
     
     try {
-        const url = `https://www.xingtu.cn/ad/creator/author-homepage/douyin-video/${xingtuId}`;
-        console.log(`[EXECUTOR] 导航至: ${url}`);
-        await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+        // 待办 1.2: 删除硬编码的导航
+        // const url = `https://www.xingtu.cn/ad/creator/author-homepage/douyin-video/${xingtuId}`;
+        // console.log(`[EXECUTOR] 导航至: ${url}`);
+        // await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
         
-        console.log('[EXECUTOR] 等待页面核心内容渲染...');
-        await page.waitForSelector('#layout-content', { timeout: 20000, visible: true });
-        console.log('[EXECUTOR] 核心内容已渲染，开始执行工作流步骤。');
+        console.log('[EXECUTOR] 开始执行工作流步骤...');
 
-        for (const step of workflow.steps) {
+        for (const step of processedWorkflow.steps) {
             console.log(`[EXECUTOR] 执行动作: ${step.action}`, step.description || '');
             
             switch (step.action) {
+                // 待办 1.3: 增加新的 'Go to URL' case
+                case 'Go to URL':
+                    if (!step.url) throw new Error("'Go to URL' action requires a 'url' parameter.");
+                    console.log(`[EXECUTOR] 导航至: ${step.url}`);
+                    await page.goto(step.url, { waitUntil: 'networkidle2', timeout: 60000 });
+                    // 在导航后增加一个标准的等待，确保页面内容稳定
+                    await page.waitForSelector('#layout-content', { timeout: 20000, visible: true });
+                    break;
                 case 'wait':
                     await new Promise(resolve => setTimeout(resolve, step.milliseconds || 1000));
                     break;
@@ -338,7 +369,8 @@ async function executeActions(xingtuId, taskId, workflow) {
                         if (!elementShot) throw new Error(`普通截图失败：找不到元素 ${step.selector}`);
                         screenshotBuffer = await elementShot.screenshot();
                     }
-                    const screenshotUrl = await uploadToTOS(screenshotBuffer, taskId.toString(), fileName);
+                    // 使用 task._id.toString() 作为TOS路径的一部分
+                    const screenshotUrl = await uploadToTOS(screenshotBuffer, task._id.toString(), fileName);
                     results.screenshots.push({ name: fileName, url: screenshotUrl });
                     break;
                 }
@@ -395,4 +427,3 @@ async function executeActions(xingtuId, taskId, workflow) {
 }
 
 module.exports = { handleLogin, executeActions };
-
