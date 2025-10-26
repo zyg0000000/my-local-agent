@@ -304,6 +304,8 @@ async function executeActions(task, workflow) {
     const context = {
         xingtuId: task.xingtuId,
         taskId: task.taskId, // taskId for starquest, _id for database
+        videoId: task.videoId,
+        targetId: task.targetId,
         collaborationId: task.metadata?.collaborationId,
     };
 
