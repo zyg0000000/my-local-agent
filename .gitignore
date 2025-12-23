@@ -7,3 +7,7 @@ node_modules/
 # 忽略截图和用户数据文件夹
 screenshots/
 user_data_agent/
+
+# 忽略敏感凭证文件
+xingtu-cookies.json
+*.cookies.json
