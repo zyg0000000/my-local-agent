@@ -110,7 +110,8 @@ app.post('/api/task/execute', async (req, res) => {
         }
 
         // 构建任务对象（与 local-agent.js 格式一致）
-        const inputKey = workflow.requiredInput?.key || 'xingtuId';
+        // [v3.1] 优先使用 inputConfig（agentworks_db 新格式），兼容 requiredInput（旧格式）
+        const inputKey = workflow.inputConfig?.key || workflow.requiredInput?.key || 'xingtuId';
         const task = {
             _id: new ObjectId(),
             [inputKey]: inputValue,
