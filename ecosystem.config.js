@@ -58,6 +58,30 @@ module.exports = {
       },
       watch: false,
       kill_timeout: 10000
+    },
+
+    // 全局定时调度器：根据配置自动执行日报抓取
+    {
+      name: 'scheduler',
+      script: 'scheduler.js',
+      cwd: '/opt/puppeteer-executor',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      restart_delay: 5000,
+      max_memory_restart: '200M',  // 调度器内存占用很小
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      error_file: '/opt/puppeteer-executor/logs/scheduler-error.log',
+      out_file: '/opt/puppeteer-executor/logs/scheduler-out.log',
+      merge_logs: true,
+      env: {
+        NODE_ENV: 'production',
+        TASK_SERVER_URL: 'http://localhost:3001'
+      },
+      watch: false,
+      kill_timeout: 10000
     }
   ]
 };
