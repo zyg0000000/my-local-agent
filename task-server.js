@@ -1,11 +1,14 @@
 /**
  * @file task-server.js
  * @description HTTP API 服务器，提供按需执行工作流的能力
+ * @version 3.0.0 - 双模式支持（同步 + 异步 VNC）
+ *
  * 运行方式: pm2 start task-server.js --name task-server
  *
- * 与 local-agent.js 的区别：
- * - local-agent.js: 轮询模式，持续监听 MongoDB 中的任务队列
- * - task-server.js: API 模式，按需触发执行工作流
+ * v3.0 变更：
+ * - [双模式] 非 VNC 模式：同步执行，等待完成后返回结果
+ * - [双模式] VNC 模式：异步执行，通过 SSE 获取进度
+ * - [VNC] 支持验证码手动处理暂停/恢复
  */
 
 require('dotenv').config();
@@ -17,8 +20,7 @@ const fs = require('fs');
 const path = require('path');
 
 // 引入 puppeteer-executor 的核心功能
-// executeActions 内部处理：浏览器启动、Cookie 加载、步骤执行、浏览器关闭
-const { executeActions } = require('./puppeteer-executor');
+const { executeActions, executeActionsWithProgress } = require('./puppeteer-executor');
 
 const app = express();
 app.use(cors());
@@ -32,6 +34,12 @@ const COOKIE_FILE = path.join(__dirname, 'xingtu-cookies.json');
 
 // 数据库连接
 let db = null;
+
+// ========== SSE 进度存储（仅 VNC 模式使用） ==========
+const taskProgress = new Map();
+
+// ========== 暂停任务存储（用于验证码手动处理） ==========
+const pausedTasks = new Map();  // taskId -> { resolve, page, workflow }
 
 /**
  * 初始化数据库连接
@@ -58,7 +66,8 @@ app.get('/api/workflows', async (req, res) => {
                 _id: 1,
                 name: 1,
                 requiredInput: 1,
-                description: 1
+                description: 1,
+                enableVNC: 1
             })
             .toArray();
 
@@ -68,7 +77,8 @@ app.get('/api/workflows', async (req, res) => {
             name: w.name,
             requiredInput: w.requiredInput?.key || 'xingtuId',
             inputLabel: w.requiredInput?.label || '星图 ID',
-            description: w.description || ''
+            description: w.description || '',
+            enableVNC: w.enableVNC || false
         }));
 
         res.json(result);
@@ -79,11 +89,49 @@ app.get('/api/workflows', async (req, res) => {
 });
 
 /**
- * 执行工作流
- * executeActions 内部处理浏览器生命周期，无需外部管理
+ * SSE 端点 - 实时获取任务进度（仅 VNC 模式使用）
+ */
+app.get('/api/task/stream/:taskId', (req, res) => {
+    const { taskId } = req.params;
+
+    // 设置 SSE 响应头
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    console.log(`[SSE] 客户端订阅任务进度: ${taskId}`);
+
+    // 发送当前状态
+    const sendProgress = () => {
+        const progress = taskProgress.get(taskId);
+        if (progress) {
+            res.write(`data: ${JSON.stringify(progress)}\n\n`);
+        }
+    };
+
+    // 初始发送
+    sendProgress();
+
+    // 定期检查更新（500ms）
+    const interval = setInterval(sendProgress, 500);
+
+    // 客户端断开时清理
+    req.on('close', () => {
+        console.log(`[SSE] 客户端断开: ${taskId}`);
+        clearInterval(interval);
+    });
+});
+
+/**
+ * 执行工作流（双模式支持）
+ *
+ * 模式判断：
+ * - enableVNC=true（请求参数或工作流配置）：异步模式，通过 SSE 获取进度
+ * - 其他情况：同步模式，等待执行完成后返回结果
  */
 app.post('/api/task/execute', async (req, res) => {
-    const { workflowId, inputValue, metadata } = req.body;
+    const { workflowId, inputValue, enableVNC, metadata } = req.body;
 
     if (!workflowId || !inputValue) {
         return res.status(400).json({
@@ -92,7 +140,7 @@ app.post('/api/task/execute', async (req, res) => {
         });
     }
 
-    console.log(`[API] 收到执行请求: workflow=${workflowId}, input=${inputValue}`);
+    console.log(`[API] 收到执行请求: workflow=${workflowId}, input=${inputValue}, enableVNC=${enableVNC}`);
 
     try {
         await initDB();
@@ -109,8 +157,10 @@ app.post('/api/task/execute', async (req, res) => {
             });
         }
 
-        // 构建任务对象（与 local-agent.js 格式一致）
-        // [v3.1] 优先使用 inputConfig（agentworks_db 新格式），兼容 requiredInput（旧格式）
+        // 判断是否使用 VNC 模式（请求参数优先，否则使用工作流配置）
+        const useVNC = enableVNC === true || (enableVNC === undefined && workflow.enableVNC === true);
+
+        // 构建任务对象
         const inputKey = workflow.inputConfig?.key || workflow.requiredInput?.key || 'xingtuId';
         const task = {
             _id: new ObjectId(),
@@ -120,14 +170,135 @@ app.post('/api/task/execute', async (req, res) => {
             createdAt: new Date()
         };
 
-        // 执行工作流
-        // executeActions 内部会：启动浏览器 → 加载 Cookie → 执行步骤 → 关闭浏览器
-        console.log(`[API] 开始执行工作流: ${workflow.name}`);
+        const taskId = task._id.toString();
+        const totalSteps = workflow.steps ? workflow.steps.length : 0;
+
+        // ========== VNC 模式：异步执行 ==========
+        if (useVNC) {
+            console.log(`[API] VNC 模式：异步执行工作流: ${workflow.name}`);
+
+            // 设置全局 VNC 模式标志
+            global.enableVNCMode = true;
+
+            // 启动 VNC 服务
+            try {
+                const { startVNC } = require('./vnc-manager');
+                await startVNC();
+                console.log('[API] VNC 模式已启用');
+            } catch (e) {
+                console.log('[API] 启动 VNC 失败:', e.message);
+            }
+
+            // 初始化进度状态
+            taskProgress.set(taskId, {
+                taskId,
+                status: "running",
+                currentStep: 0,
+                totalSteps,
+                currentAction: "准备中...",
+            });
+
+            // 立即返回 taskId，前端通过 SSE 获取进度
+            res.json({
+                success: true,
+                workflowId,
+                workflowName: workflow.name,
+                inputValue,
+                taskId,
+                async: true,
+                message: "任务已提交，请通过 SSE 获取进度"
+            });
+
+            // 后台异步执行
+            const startTime = Date.now();
+
+            // 进度回调
+            const onProgress = (progress) => {
+                taskProgress.set(taskId, { taskId, ...progress });
+            };
+
+            // 暂停通知回调（验证码需要手动处理时）
+            const onPause = (tid, pauseInfo) => {
+                console.log('[SSE] 推送暂停状态:', tid, pauseInfo);
+                taskProgress.set(tid, { taskId: tid, ...pauseInfo });
+
+                return new Promise((resolve) => {
+                    pausedTasks.set(tid, {
+                        resolve,
+                        page: null,
+                        workflow
+                    });
+                });
+            };
+
+            (async () => {
+                try {
+                    let results;
+                    if (typeof executeActionsWithProgress === "function") {
+                        results = await executeActionsWithProgress(task, workflow, onProgress, onPause);
+                    } else {
+                        results = await executeActions(task, workflow);
+                    }
+
+                    const duration = Date.now() - startTime;
+                    console.log(`[API] 工作流执行完成，耗时 ${duration}ms`);
+
+                    // 关闭 VNC
+                    if (global.enableVNCMode) {
+                        try {
+                            const { stopVNC } = require('./vnc-manager');
+                            await stopVNC();
+                            console.log('[API] 任务完成，VNC 已关闭');
+                            global.enableVNCMode = false;
+                        } catch (e) {
+                            console.log('[API] 关闭 VNC 失败:', e.message);
+                        }
+                    }
+
+                    // 更新最终状态
+                    console.log(`[SSE] 推送最终状态: taskId=${taskId}, status=${results.status === "failed" ? "failed" : "completed"}`);
+                    taskProgress.set(taskId, {
+                        taskId,
+                        status: results.status === "failed" ? "failed" : "completed",
+                        result: results,
+                        duration,
+                    });
+                } catch (err) {
+                    console.error(`[API] 异步执行失败: ${err.message}`);
+
+                    if (global.enableVNCMode) {
+                        try {
+                            const { stopVNC } = require('./vnc-manager');
+                            await stopVNC();
+                            global.enableVNCMode = false;
+                        } catch (e) { /* ignore */ }
+                    }
+
+                    taskProgress.set(taskId, {
+                        taskId,
+                        status: "failed",
+                        error: err.message,
+                    });
+                }
+
+                // 5分钟后清理进度数据
+                setTimeout(() => {
+                    taskProgress.delete(taskId);
+                    console.log(`[SSE] 清理进度数据: ${taskId}`);
+                }, 5 * 60 * 1000);
+            })();
+
+            return; // VNC 模式已响应，不再继续
+        }
+
+        // ========== 非 VNC 模式：同步执行 ==========
+        console.log(`[API] 同步模式：执行工作流: ${workflow.name}`);
+        global.enableVNCMode = false;
+
         const startTime = Date.now();
-
         const results = await executeActions(task, workflow);
-
         const duration = Date.now() - startTime;
+
         console.log(`[API] 工作流执行完成，耗时 ${duration}ms`);
 
         res.json({
@@ -135,7 +306,7 @@ app.post('/api/task/execute', async (req, res) => {
             workflowId,
             workflowName: workflow.name,
             inputValue,
-            taskId: task._id.toString(),
+            taskId,
             duration,
             results
         });
@@ -289,6 +460,63 @@ app.get('/api/status', (req, res) => {
 });
 
 /**
+ * 恢复暂停的任务（用户完成验证码后调用，仅 VNC 模式）
+ */
+app.post('/api/task/:taskId/resume', async (req, res) => {
+    const { taskId } = req.params;
+
+    console.log('[API] 收到恢复任务请求:', taskId);
+
+    const paused = pausedTasks.get(taskId);
+
+    if (!paused) {
+        return res.status(404).json({
+            success: false,
+            error: '任务不存在或未暂停'
+        });
+    }
+
+    try {
+        // 检查验证码是否已消失
+        const { detectSliderCaptcha } = require('./puppeteer-executor');
+        const captchaStillExists = await detectSliderCaptcha(paused.page);
+
+        if (captchaStillExists) {
+            return res.json({
+                success: false,
+                message: '验证码仍然存在，请先完成验证后再点击继续'
+            });
+        }
+
+        console.log('[API] 验证码已处理，恢复任务执行:', taskId);
+        console.log('[API] VNC 保持运行，浏览器继续执行...');
+
+        // 更新进度状态
+        taskProgress.set(taskId, {
+            taskId,
+            status: 'running',
+            message: '验证码已处理，继续执行...'
+        });
+
+        // 触发恢复回调
+        paused.resolve({ resumed: true });
+        pausedTasks.delete(taskId);
+
+        res.json({
+            success: true,
+            message: '任务已恢复执行'
+        });
+
+    } catch (err) {
+        console.error('[API] 恢复任务失败:', err);
+        res.status(500).json({
+            success: false,
+            error: err.message
+        });
+    }
+});
+
+/**
  * 健康检查
  */
 app.get('/health', (req, res) => {
@@ -298,11 +526,14 @@ app.get('/health', (req, res) => {
 // 启动服务器
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[TASK-SERVER] HTTP API 服务器运行在 http://0.0.0.0:${PORT}`);
+    console.log('[TASK-SERVER] v3.0.0 - 双模式支持（同步 + 异步 VNC）');
     console.log('[TASK-SERVER] 可用端点:');
-    console.log('  GET  /api/workflows       - 获取工作流列表');
-    console.log('  POST /api/task/execute    - 执行单个任务');
-    console.log('  POST /api/task/batch      - 批量执行任务');
-    console.log('  GET  /api/cookie-status   - 检查 Cookie 状态');
-    console.log('  GET  /api/status          - 服务器状态');
-    console.log('  GET  /health              - 健康检查');
+    console.log('  GET  /api/workflows            - 获取工作流列表');
+    console.log('  POST /api/task/execute         - 执行单个任务（双模式）');
+    console.log('  GET  /api/task/stream/:taskId  - SSE 实时进度（VNC 模式）');
+    console.log('  POST /api/task/:taskId/resume  - 恢复暂停任务（VNC 模式）');
+    console.log('  POST /api/task/batch           - 批量执行任务');
+    console.log('  GET  /api/cookie-status        - 检查 Cookie 状态');
+    console.log('  GET  /api/status               - 服务器状态');
+    console.log('  GET  /health                   - 健康检查');
 });
