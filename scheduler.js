@@ -1,7 +1,23 @@
 /**
  * @file scheduler.js
- * @version 1.4.1
+ * @version 1.4.3
  * @description 全局定时调度器 - 根据 system_config 配置自动执行日报数据抓取
+ *
+ * v1.4.3 变更 (2026-01-07):
+ * - 修复数据存储与前端不一致的问题（4项修复）
+ * - 新增 parseNumericValue: 解析数值字符串为数字（如 "3,705,346" → 3705346）
+ * - 新增 parseDataFromResult: 解析 ECS 返回数据的所有字段
+ * - 保存前先 $pull 删除当日旧数据，实现同日覆盖
+ * - 使用 $each + $sort 保持 dailyStats 按日期排序
+ * - 更新 lastReportDate 字段
+ *
+ * v1.4.2 变更 (2026-01-07):
+ * - 修复联投日报无法执行的严重 Bug
+ * - getJointCollaborationsToFetch: 从 collaborations 集合查询，而不是 project.collaborations
+ * - 添加实际的状态名称：'客户已定档', '视频已发布'（之前只有 '已定档', '已发布'）
+ * - 联投日报必须有 videoId 才能抓取
+ * - 修复联投日报数据保存：抓取成功后保存到 collaboration 的 dailyStats
+ * - 修复联投日报输入参数：使用 taskId（星图任务ID）而不是 videoId
  *
  * v1.4.1 变更 (2026-01-07):
  * - 修复星图任务ID字段名：xingtuTaskId → taskId（与云函数保持一致）
@@ -69,11 +85,61 @@ const TASK_SERVER_URL = process.env.TASK_SERVER_URL || 'http://localhost:3001';
 const SCHEDULER_CONFIG_COLLECTION = 'system_config';
 const SCHEDULED_EXECUTIONS_COLLECTION = 'scheduled_executions';
 const PROJECTS_COLLECTION = 'projects';
+const COLLABORATIONS_COLLECTION = 'collaborations';  // v1.4.2: 新增合作记录集合
 const WORKFLOWS_COLLECTION = 'automation-workflows';
 
 // --- 数据库客户端 ---
 let client;
 let db;
+
+/**
+ * v1.4.3: 解析数值字符串为数字（与前端 parseNumericValue 保持一致）
+ * 支持格式:
+ * - "1,169,823" -> 1169823
+ * - "16.79w" -> 167900
+ * - "0.07%" -> 0.07 (百分比保留原值)
+ */
+function parseNumericValue(value) {
+    if (typeof value === 'number') return value;
+    if (typeof value !== 'string') return null;
+
+    const str = value.trim();
+    if (!str) return null;
+
+    // 处理百分比（保留原值，如 0.07%）
+    if (str.endsWith('%')) {
+        const num = parseFloat(str.slice(0, -1).replace(/,/g, ''));
+        return isNaN(num) ? null : num;
+    }
+
+    // 处理万（w）格式
+    const wanMatch = str.match(/^([\d,.]+)\s*[w万]$/i);
+    if (wanMatch) {
+        const num = parseFloat(wanMatch[1].replace(/,/g, ''));
+        return isNaN(num) ? null : Math.round(num * 10000);
+    }
+
+    // 普通数字（移除逗号）
+    const num = parseFloat(str.replace(/,/g, ''));
+    return isNaN(num) ? null : Math.round(num);
+}
+
+/**
+ * v1.4.3: 解析 ECS 返回的数据对象，将所有字符串值转为数字
+ */
+function parseDataFromResult(rawData) {
+    if (!rawData || typeof rawData !== 'object') return null;
+
+    const parsedData = {};
+    for (const [key, value] of Object.entries(rawData)) {
+        const num = parseNumericValue(value);
+        if (num !== null) {
+            parsedData[key] = num;
+        }
+    }
+
+    return Object.keys(parsedData).length > 0 ? parsedData : null;
+}
 
 /**
  * 初始化数据库连接
@@ -616,45 +682,88 @@ async function executeJointProjectFetch(project, projectConfig) {
         const collab = collaborations[i];
         const taskStartTime = Date.now();
 
-        // 联投日报使用 videoId
-        // v1.3.2: 优先使用直接的 videoId 字段
-        const videoId = collab.videoId || collab.videoUrl?.match(/video\/(\d+)/)?.[1] || null;
+        // v1.4.2 修复：联投日报使用星图任务ID (taskId)，不是 videoId
+        // 工作流需要 taskId 来访问星图营销报告页面
+        const taskId = collab.taskId || collab.xingtuTaskId || null;
+        const videoId = collab.videoId || null;  // 保留 videoId 用于记录
 
-        if (!videoId) {
-            console.log(`[SCHEDULER] 联投合作 ${collab.id} 无视频ID，跳过`);
+        if (!taskId) {
+            console.log(`[SCHEDULER] 联投合作 ${collab.id} (${collab.talentName}) 无星图任务ID，跳过`);
             skippedCount++;
             updatedTasks.push({
                 collaborationId: collab.id,
                 talentName: collab.talentName || '',
-                videoId: null,
+                videoId: videoId,
+                taskId: null,
                 status: 'skipped',
-                error: '无视频ID',
+                error: '无星图任务ID',
                 duration: Date.now() - taskStartTime
             });
             continue;
         }
 
         try {
-            console.log(`[SCHEDULER] [${i + 1}/${collaborations.length}] ${collab.talentName || collab.id} - 联投抓取 - videoId: ${videoId}`);
+            console.log(`[SCHEDULER] [${i + 1}/${collaborations.length}] ${collab.talentName || collab.id} - 联投抓取 - taskId: ${taskId}`);
 
             // 调用 task-server 执行抓取
+            // v1.4.2 修复：使用 taskId（星图任务ID）作为输入，不是 videoId
             const response = await axios.post(`${TASK_SERVER_URL}/api/task/execute`, {
                 workflowId: workflowId,
-                inputValue: videoId,
+                inputValue: taskId,  // 使用星图任务ID
                 accountId: projectConfig.accountId || undefined,  // 使用指定账户
                 metadata: {
                     projectId,
                     collaborationId: collab.id,
                     reportDate: today,
                     source: 'scheduler',
-                    projectType: 'joint'
+                    projectType: 'joint',
+                    taskId: taskId,
+                    videoId: videoId
                 }
             }, {
                 timeout: 120000 // 120秒超时
             });
 
             if (response.data.success) {
-                const views = response.data.results?.result?.data?.['播放量'];
+                // v1.4.3: 解析 ECS 返回的数据（字符串转数字）
+                const rawData = response.data.results?.result?.data || {};
+                const parsedData = parseDataFromResult(rawData);
+                const views = parsedData?.['播放量'];
+
+                // v1.4.3: 保存数据到 collaboration 的 dailyStats（与前端云函数逻辑一致）
+                if (parsedData && Object.keys(parsedData).length > 0) {
+                    // 步骤1: 先删除当日已有数据（实现同日覆盖）
+                    await db.collection(COLLABORATIONS_COLLECTION).updateOne(
+                        { id: collab.id },
+                        { $pull: { dailyStats: { date: today } } }
+                    );
+
+                    // 步骤2: 插入新数据（使用 $each + $sort 保持按日期排序）
+                    await db.collection(COLLABORATIONS_COLLECTION).updateOne(
+                        { id: collab.id },
+                        {
+                            $push: {
+                                dailyStats: {
+                                    $each: [{
+                                        date: today,
+                                        data: parsedData,  // 已解析为数字的数据
+                                        solution: '',
+                                        source: 'scheduler',
+                                        createdAt: new Date(),
+                                        updatedAt: new Date()
+                                    }],
+                                    $sort: { date: 1 }  // 按日期升序排序
+                                }
+                            },
+                            $set: {
+                                updatedAt: new Date(),
+                                lastReportDate: today  // 更新最后报告日期
+                            }
+                        }
+                    );
+                    console.log(`[SCHEDULER] 已保存 ${collab.talentName} 的日报数据到 dailyStats`);
+                }
+
                 successCount++;
                 updatedTasks.push({
                     collaborationId: collab.id,
@@ -662,11 +771,12 @@ async function executeJointProjectFetch(project, projectConfig) {
                     videoId: videoId,
                     workflowUsed: workflowName,
                     status: 'success',
-                    fetchedViews: views ? parseInt(String(views).replace(/,/g, ''), 10) : null,
+                    fetchedViews: views || null,
+                    fetchedData: parsedData,  // v1.4.3: 记录已解析的数据
                     error: null,
                     duration: Date.now() - taskStartTime
                 });
-                console.log(`[SCHEDULER] ✓ 成功: ${collab.talentName || collab.id} - 播放量: ${views || '未获取'}`);
+                console.log(`[SCHEDULER] ✓ 成功: ${collab.talentName || collab.id} - 播放量: ${views || '-'}`);
             } else {
                 throw new Error(response.data.error || '抓取失败');
             }
@@ -726,20 +836,38 @@ async function executeJointProjectFetch(project, projectConfig) {
 }
 
 /**
- * v1.2: 获取联投项目中需要抓取的合作记录
+ * v1.4.2: 获取联投项目中需要抓取的合作记录
  * 联投日报使用 fetchableDate 规则（T+1）
+ *
+ * v1.4.2 修复:
+ * - 从 collaborations 集合查询，而不是 project.collaborations（项目文档中没有此字段）
+ * - 添加实际的状态名称：'客户已定档', '视频已发布'
+ * - 联投日报必须有 videoId 才能抓取
  */
 async function getJointCollaborationsToFetch(project, today) {
-    const collaborations = project.collaborations || [];
+    // v1.4.2 修复：从 collaborations 集合查询合作记录
+    const collaborations = await db.collection(COLLABORATIONS_COLLECTION).find({
+        projectId: project.id
+    }).toArray();
+
+    console.log(`[SCHEDULER] 联投项目 ${project.name} 共有 ${collaborations.length} 条合作记录`);
 
     // 筛选条件:
-    // 1. 状态为已定档或已发布
-    // 2. 今天没有 dailyStats 数据
-    // 3. fetchableDate <= today（T+1 规则）
-    const validStatuses = ['已定档', '已发布', 'scheduled', 'published'];
+    // 1. 状态为已定档或已发布（包含完整状态名）
+    // 2. 必须有 videoId
+    // 3. 今天没有 dailyStats 数据
+    // 4. fetchableDate <= today（T+1 规则）
+    // v1.4.2 修复：添加实际的状态名称
+    const validStatuses = ['客户已定档', '视频已发布', '已定档', '已发布', 'scheduled', 'published'];
 
-    return collaborations.filter(collab => {
+    const result = collaborations.filter(collab => {
+        // 状态筛选
         if (!validStatuses.includes(collab.status)) {
+            return false;
+        }
+
+        // v1.4.2: 联投日报必须有 videoId
+        if (!collab.videoId) {
             return false;
         }
 
@@ -761,6 +889,9 @@ async function getJointCollaborationsToFetch(project, today) {
         const hasDataToday = (collab.dailyStats || []).some(stat => stat.date === today);
         return !hasDataToday;
     });
+
+    console.log(`[SCHEDULER] 联投项目 ${project.name} 筛选后有 ${result.length} 条待抓取记录`);
+    return result;
 }
 
 /**
